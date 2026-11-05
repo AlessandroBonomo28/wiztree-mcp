@@ -497,11 +497,91 @@ class RunResult:
     timed_out: bool
 
 
+class _ShellExecuteInfo(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", wintypes.DWORD),
+        ("fMask", wintypes.ULONG),
+        ("hwnd", wintypes.HWND),
+        ("lpVerb", wintypes.LPCWSTR),
+        ("lpFile", wintypes.LPCWSTR),
+        ("lpParameters", wintypes.LPCWSTR),
+        ("lpDirectory", wintypes.LPCWSTR),
+        ("nShow", ctypes.c_int),
+        ("hInstApp", wintypes.HINSTANCE),
+        ("lpIDList", ctypes.c_void_p),
+        ("lpClass", wintypes.LPCWSTR),
+        ("hkeyClass", wintypes.HKEY),
+        ("dwHotKey", wintypes.DWORD),
+        ("hIcon", wintypes.HANDLE),
+        ("hProcess", wintypes.HANDLE),
+    ]
+
+
+def _run_elevated(exe: str, args: list[str], timeout: float) -> int:
+    """Keep a handle to the elevated process, not WizTree's short-lived launcher."""
+    shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    shell32.ShellExecuteExW.argtypes = [ctypes.POINTER(_ShellExecuteInfo)]
+    shell32.ShellExecuteExW.restype = wintypes.BOOL
+    kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    kernel32.WaitForSingleObject.restype = wintypes.DWORD
+    kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+    kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+    kernel32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+    kernel32.TerminateProcess.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    info = _ShellExecuteInfo()
+    info.cbSize = ctypes.sizeof(info)
+    # NOCLOSEPROCESS | NOASYNC | FLAG_NO_UI: UAC consent is still shown by Windows.
+    info.fMask = 0x40 | 0x100 | 0x400
+    info.lpVerb = "runas"
+    info.lpFile = exe
+    info.lpParameters = subprocess.list2cmdline(args)
+    info.nShow = 0  # SW_HIDE
+    if not shell32.ShellExecuteExW(ctypes.byref(info)):
+        error = ctypes.get_last_error()
+        if error == 1223:  # ERROR_CANCELLED
+            raise RuntimeError("WizTree administrator request was cancelled.")
+        raise ctypes.WinError(error)
+    if not info.hProcess:
+        raise RuntimeError("Windows returned no handle for elevated WizTree.")
+    try:
+        # The scan timeout starts after Windows finishes the UAC consent dialog.
+        status = kernel32.WaitForSingleObject(info.hProcess, int(timeout * 1000))
+        if status == 0x102:  # WAIT_TIMEOUT
+            if not kernel32.TerminateProcess(info.hProcess, 1):
+                raise RuntimeError(
+                    "Elevated WizTree timed out and could not be stopped; "
+                    "close that scan before retrying."
+                )
+            kernel32.WaitForSingleObject(info.hProcess, 10000)
+            # Never let callers accept a partial export on timeout.
+            raise TimeoutError(f"Elevated WizTree scan aborted after {timeout}s.")
+        if status != 0:  # WAIT_OBJECT_0
+            raise ctypes.WinError(ctypes.get_last_error())
+        exit_code = wintypes.DWORD()
+        if not kernel32.GetExitCodeProcess(info.hProcess, ctypes.byref(exit_code)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        if exit_code.value:
+            raise RuntimeError(f"Elevated WizTree failed (exit code {exit_code.value}).")
+        return exit_code.value
+    finally:
+        kernel32.CloseHandle(info.hProcess)
+
+
 def run_wiztree(args: list[str], timeout: float) -> RunResult:
     """Run WizTree once, serialised against every other run."""
     exe = resolve_wiztree_exe()
+    # WizTree documents drive targets as C:, avoiding a quoted trailing backslash.
+    if args and _DRIVE_ONLY.fullmatch(args[0]):
+        args = [args[0][:2], *args[1:]]
     with _RUN_LOCK:
         started = time.monotonic()
+        if "/admin=1" in args and not is_elevated():
+            exit_code = _run_elevated(exe, args, timeout)
+            return RunResult(exit_code, time.monotonic() - started, False)
         creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         process = subprocess.Popen(  # noqa: S603 - arguments are built here, never shell
             [exe, *args],

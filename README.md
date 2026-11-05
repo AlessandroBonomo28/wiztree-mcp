@@ -263,8 +263,10 @@ in seconds. But reading the MFT requires administrator privileges.
 - **Non-elevated** process (the normal case with Cursor): WizTree falls back to a recursive
   folder scan. On `C:\` it can take several minutes; on a single folder
   it is still fast (~500k files in 5 seconds).
-- `admin: true`: WizTree relaunches elevated and uses the MFT. This triggers the **Windows UAC
-  prompt**, which must be accepted manually.
+- `admin: true`: the server starts WizTree elevated and waits for that process to finish
+  before reading the export. This triggers the **Windows UAC prompt**, which must be
+  accepted manually. The scan timeout starts after consent; cancelling consent returns
+  a tool error. Only WizTree is elevated, not the MCP server.
 
 If you need this often, launch Cursor as administrator: the server inherits elevation and
 all scans become immediate with no further prompts. `wiztree_info` tells you which
@@ -284,6 +286,12 @@ situation you are in.
 ---
 
 ## Tests
+
+Windows-only launch regression tests (no UAC prompt or real scan):
+
+```bash
+python -m unittest test_launch.py
+```
 
 ```bash
 .venv\Scripts\python.exe test_smoke.py
